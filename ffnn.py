@@ -1,320 +1,489 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 import torch
-import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
+from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, confusion_matrix
-import torch.nn.functional as F
+from scaler import init_scaler_x, init_scaler_y, scaler_x_encode, scaler_y_decode, scaler_y_encode
+from tqdm import tqdm
+from sklearn.metrics import mean_absolute_error, confusion_matrix, accuracy_score
+from eda import  outlier, plot_3d_scatter
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import sys
-import re
-from sklearn.metrics import f1_score, precision_score, recall_score
-
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
 
 def read_data(filename):
     data = np.load(filename, allow_pickle=True)
-    df = pd.DataFrame(data.tolist() if data.dtype == 'O' and isinstance(data[0], dict) else data)
-    return df
-
+    return pd.DataFrame(data.tolist())
 
 def npy_preprocessor(filename):
     df = read_data(filename)
-    return df['index'].values, df['inchi'].values, df['xyz'].values, df['chiral_centers'].values, df['rotation'].values
+    # return df[df['chiral_centers'].apply(lambda x: len(x) == 1)].reset_index(drop=True)
+    return df
 
 
-def filter_data(index_array, xyz_arrays, chiral_centers_array, rotation_array, task):
-    if task == 0:
-        filtered_indices = [i for i in range(len(index_array))]
-        filtered_index_array = [index_array[i] for i in filtered_indices]
-        filtered_xyz_arrays = [xyz_arrays[i] for i in filtered_indices]
-        filtered_chiral_centers_array = [chiral_centers_array[i] for i in filtered_indices]
-        filtered_rotation_array = [rotation_array[i] for i in filtered_indices]
-        return filtered_index_array, filtered_xyz_arrays, filtered_chiral_centers_array, filtered_rotation_array
-
-    if task == 1:
-        #return only chiral_length <2
-        filtered_indices = [i for i in range(len(index_array)) if len(chiral_centers_array[i]) < 2]
-        filtered_index_array = [index_array[i] for i in filtered_indices]
-        filtered_xyz_arrays = [xyz_arrays[i] for i in filtered_indices]
-        filtered_chiral_centers_array = [chiral_centers_array[i] for i in filtered_indices]
-        filtered_rotation_array = [rotation_array[i] for i in filtered_indices]
-        return filtered_index_array, filtered_xyz_arrays, filtered_chiral_centers_array, filtered_rotation_array
-
-    elif task == 2:
-        #only return chiral legnth < 5
-        filtered_indices = [i for i in range(len(index_array)) if len(chiral_centers_array[i]) < 5]
-        filtered_index_array = [index_array[i] for i in filtered_indices]
-        filtered_xyz_arrays = [xyz_arrays[i] for i in filtered_indices]
-        filtered_chiral_centers_array = [chiral_centers_array[i] for i in filtered_indices]
-        filtered_rotation_array = [rotation_array[i] for i in filtered_indices]
-        return filtered_index_array, filtered_xyz_arrays, filtered_chiral_centers_array, filtered_rotation_array
-    elif task == 3: 
-        # Step 1: Filter indices where the length of chiral_centers_array is exactly 1 and the first tuple contains 'R' or 'S'
-        filtered_indices = [i for i in range(len(index_array)) if len(chiral_centers_array[i]) == 1 and ('R' == chiral_centers_array[i][0][1] or 'S' == chiral_centers_array[i][0][1])]
-        # Step 2: Create filtered arrays for index_array, xyz_arrays, chiral_centers_array, and rotation_array
-        filtered_index_array = [index_array[i] for i in filtered_indices]
-        filtered_xyz_arrays = [xyz_arrays[i] for i in filtered_indices]
-        
-        filtered_chiral_centers_array = [chiral_centers_array[i] for i in filtered_indices]
-        
-        # Step 5: Filter the rotation_array accordingly
-        filtered_rotation_array = [rotation_array[i] for i in filtered_indices]
-        return filtered_index_array, filtered_xyz_arrays, filtered_chiral_centers_array, filtered_rotation_array
+def apply_rotation_molecule(matrix, rotation_angle_deg=15.0):
+    matrix_copy = matrix.copy()
     
-    elif task == 4:
-        # only return chiral_length == 1
-        filtered_indices = [i for i in range(len(index_array)) if len(chiral_centers_array[i]) == 1]
-        filtered_index_array = [index_array[i] for i in filtered_indices]
-        filtered_xyz_arrays = [xyz_arrays[i] for i in filtered_indices]
-        filtered_chiral_centers_array = [chiral_centers_array[i] for i in filtered_indices]
-        filtered_rotation_array = [rotation_array[i] for i in filtered_indices]
-        return filtered_index_array, filtered_xyz_arrays, filtered_chiral_centers_array, filtered_rotation_array
-    elif task == 5:
-        filtered_indices = [i for i in range(len(index_array))]
-        filtered_index_array = [index_array[i] for i in filtered_indices]
-        filtered_xyz_arrays = [xyz_arrays[i] for i in filtered_indices]
-        filtered_chiral_centers_array = [chiral_centers_array[i] for i in filtered_indices]
-        filtered_rotation_array = [rotation_array[i] for i in filtered_indices]
-        return filtered_index_array, filtered_xyz_arrays, filtered_chiral_centers_array, filtered_rotation_array
+    is_padded_atom_mask = np.all(matrix_copy[:, 3:] == 0, axis=1)
+    real_atom_mask = ~is_padded_atom_mask
 
+    coords = matrix_copy[real_atom_mask, :3]
+    if coords.shape[0] == 0:
+        return matrix_copy 
 
-def generate_label(index_array, xyz_arrays, chiral_centers_array, rotation_array, task):
-    # Task 0 or Task 1: Binary classification based on the presence of chiral centers
-    if task == 0 or task == 1:
-        return [1 if len(chiral_centers) > 0 else 0 for chiral_centers in chiral_centers_array]
+    angle_rad = np.radians(rotation_angle_deg)
+    axis = np.random.rand(3)
+    axis /= np.linalg.norm(axis)
     
-    # Task 2: Return the number of chiral centers
-    elif task == 2:
-        return [len(chiral_centers) for chiral_centers in chiral_centers_array]
+    c = np.cos(angle_rad)
+    s = np.sin(angle_rad)
+    t = 1 - c
+    x, y, z = axis
     
-    # Task 3: Assuming that the task is to return something from chiral_centers_array, not rotation_array
-    elif task == 3:
-        return [
-            1 if chiral_centers and len(chiral_centers[0]) > 1 and 'R' == chiral_centers[0][1] else 0
-            for chiral_centers in chiral_centers_array
-        ]
+    rotation_matrix = np.array([
+        [t*x*x + c,   t*x*y - s*z, t*x*z + s*y],
+        [t*x*y + s*z, t*y*y + c,   t*y*z - s*x],
+        [t*x*z - s*y, t*y*z + s*x, t*z*z + c]
+    ])
+    
+    rotated_coords = coords @ rotation_matrix.T
+    matrix_copy[real_atom_mask, :3] = rotated_coords
+    
+    return matrix_copy
 
-    # Task 4 or Task 5: Binary classification based on posneg value in rotation_array
-    elif task == 4 or task == 5:
-        return [1 if posneg[0] > 0 else 0 for posneg in rotation_array]
+def apply_translation_molecule(matrix, translation_vector):
+    """Applies a given translation vector to the molecule's coordinates."""
+    matrix_copy = matrix.copy()
+    
+    is_padded_atom_mask = np.all(matrix_copy[:, 3:] == 0, axis=1)
+    real_atom_mask = ~is_padded_atom_mask
 
-def generate_label_array(index_array, xyz_arrays, chiral_centers_array, rotation_array, task):
-    # Fix to directly return the output of generate_label
-    return generate_label(index_array, xyz_arrays, chiral_centers_array, rotation_array, task)
+    matrix_copy[real_atom_mask, :3] += translation_vector
+    
+    return matrix_copy
 
-# 121416 item, each associated with a 27 row, 8 col matrix, apply global normalization to col 0,1,2 Rescaling data to a [0, 1]
+def apply_nuclear_uncertainty_molecule(matrix, coord_std, strength=0.05):
+    """Applies random noise to simulate nuclear uncertainty."""
+    matrix_copy = matrix.copy()
+    
+    is_padded_atom_mask = np.all(matrix_copy[:, 3:] == 0, axis=1)
+    real_atom_mask = ~is_padded_atom_mask
 
-def reflect_wrt_plane(xyz, plane_normal=[0, 0, 1]):
-    plane_normal = plane_normal / np.linalg.norm(plane_normal)
-    d = np.dot(xyz, plane_normal)
-    return xyz - 2 * np.outer(d, plane_normal)
+    coords = matrix_copy[real_atom_mask, :3]
+    if coords.shape[0] == 0:
+        return matrix_copy
 
-def rotate_xyz(xyz, angles):
-    theta_x, theta_y, theta_z = np.radians(angles)
-    Rx = np.array([[1,0,0],
-                   [0,np.cos(theta_x),-np.sin(theta_x)],
-                   [0,np.sin(theta_x), np.cos(theta_x)]])
-    Ry = np.array([[ np.cos(theta_y),0,np.sin(theta_y)],
-                   [0,1,0],
-                   [-np.sin(theta_y),0,np.cos(theta_y)]])
-    Rz = np.array([[np.cos(theta_z),-np.sin(theta_z),0],
-                   [np.sin(theta_z), np.cos(theta_z),0],
-                   [0,0,1]])
-    R = Rz @ Ry @ Rx
-    return np.dot(xyz, R.T)
+    noise = np.random.randn(*coords.shape)
+    scaled_noise = noise * coord_std * strength
+    perturbed_coords = coords + scaled_noise
+    
+    matrix_copy[real_atom_mask, :3] = perturbed_coords
+    
+    return matrix_copy
 
-def split_data(index_array, xyz_arrays, chiral_centers_array, rotation_array):
-    train_idx, test_idx = train_test_split(range(len(index_array)), test_size=0.1, random_state=42)
-    train_idx, val_idx = train_test_split(train_idx, test_size=0.05, random_state=42)
+def augmented_dataset(fold_train_df):
+    np.random.seed(42) 
+    augmented_dfs = [] 
+    train_coord_std = np.array([1.661206, 1.997469, 1.440860])
 
-    def subset(indices):
-        return ([index_array[i] for i in indices],
-                [xyz_arrays[i] for i in indices],
-                [chiral_centers_array[i] for i in indices],
-                [rotation_array[i] for i in indices])
-    return subset(train_idx), subset(val_idx), subset(test_idx)
+    # --- 1. Rotation Augmentation ---
+    rot_df = fold_train_df.copy()
+    rotation_angle = np.random.uniform(0, 300)
+    rot_df['xyz'] = rot_df['xyz'].apply(lambda m: apply_rotation_molecule(m, rotation_angle_deg=rotation_angle))
+    augmented_dfs.append(rot_df)
 
-def normalize_xyz_train(xyz_arrays):
-    x_array = np.array([xyz[:,0] for xyz in xyz_arrays])
-    y_array = np.array([xyz[:,1] for xyz in xyz_arrays])
-    z_array = np.array([xyz[:,2] for xyz in xyz_arrays])
-    min_val = min(np.min(x_array), np.min(y_array), np.min(z_array))
-    max_val = max(np.max(x_array), np.max(y_array), np.max(z_array))
-    return min_val, max_val, [((xyz[:,:3]-min_val)/(max_val-min_val)) for xyz in xyz_arrays]
+    # --- 2. Translation Augmentation ---
+    trans_df = fold_train_df.copy()
+    translation_vector = np.random.uniform(-0.5, 0.5, size=3)
+    trans_df['xyz'] = trans_df['xyz'].apply(lambda m: apply_translation_molecule(m, translation_vector=translation_vector))
+    augmented_dfs.append(trans_df)
 
-def apply_normalization(xyz_arrays, min_val, max_val):
-    return [((xyz[:,:3]-min_val)/(max_val-min_val)) for xyz in xyz_arrays]
-
-def augment_dataset(index_array, xyz_arrays, chiral_centers_array, rotation_array, label_array, task):
-    aug_idx, aug_xyz, aug_chiral, aug_rot, aug_label = list(index_array), list(xyz_arrays), list(chiral_centers_array), list(rotation_array), list(label_array)
-    for i in range(len(index_array)):
-        if len(chiral_centers_array[i]) == 1:
-            reflected_xyz = xyz_arrays[i].copy()
-            reflected_xyz[:, :3] = reflect_wrt_plane(xyz_arrays[i][:, :3], [0,0,1])
-            reflected_label = label_array[i]
-            if task == 3: reflected_label = 1 - reflected_label
-            elif task in [4,5]: reflected_label = -reflected_label
-            aug_idx.append(index_array[i])
-            aug_xyz.append(reflected_xyz)
-            aug_chiral.append(chiral_centers_array[i])
-            aug_rot.append(rotation_array[i])
-            aug_label.append(reflected_label)
-    return aug_idx, aug_xyz, aug_chiral, aug_rot, aug_label
-
-# take in argument from shell task
-task = int(sys.argv[1])
-
-
-# Neural Network Model
-class FFNN(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(FFNN, self).__init__()
-        # Move layers to the specified device
-        self.fc1 = nn.Linear(input_size, hidden_size).to(device)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_size, output_size).to(device)
-        self.device = device
+    # --- 3. Nuclear Uncertainty Augmentation ---
+    uncert_df = fold_train_df.copy()
+    uncertainty_strength = np.random.uniform(0, 0.001)
+    uncert_df['xyz'] = uncert_df['xyz'].apply(lambda m: apply_nuclear_uncertainty_molecule(m, train_coord_std, strength=uncertainty_strength))
+    augmented_dfs.append(uncert_df)
+    
+    # --- 4. Conditional Reflection Augmentation ---
+    reflect_df = fold_train_df.copy()
+    chiral_mask = reflect_df['chiral_centers'].apply(lambda x: len(x) == 1)
+    
+    if chiral_mask.any():
+        # Apply reflection to coordinates (xyz) for chiral molecules
+        reflect_df.loc[chiral_mask, 'xyz'] = reflect_df.loc[chiral_mask, 'xyz'].apply(lambda xyz: xyz * -1)
         
+        # Multiply the rotation vector by -1 for the same chiral molecules
+        reflect_df.loc[chiral_mask, 'rotation'] = reflect_df.loc[chiral_mask, 'rotation'].apply(lambda rot: [val * -1 for val in rot])
+        
+    augmented_dfs.append(reflect_df)
+
+    return pd.concat(augmented_dfs, ignore_index=True)
+
+
+
+class ViTMultiHead(nn.Module):
+    def __init__(self, img_shape=(27, 8), in_channels=1, patch_size=(9, 4), 
+                 embed_dim=128, num_layers=4, nhead=4, dropout_rate=0.1):
+        super().__init__()
+        self.img_shape = img_shape
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+
+        patch_h, patch_w = patch_size
+        img_h, img_w = img_shape
+        
+        num_patches = (img_h // patch_h) * (img_w // patch_w)
+        patch_dim = in_channels * patch_h * patch_w
+
+        self.patch_embedding = nn.Linear(patch_dim, embed_dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        self.positional_encoding = nn.Parameter(torch.randn(1, num_patches + 1, embed_dim))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, 
+            nhead=nhead, 
+            dim_feedforward=embed_dim * 4, 
+            dropout=dropout_rate,
+            batch_first=True, 
+            activation='gelu'
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+
+        self.head_rot_reg = nn.Linear(embed_dim, 3)
+
+
     def forward(self, x):
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
-        return x
+        N, C, H, W = x.shape
+        patch_h, patch_w = self.patch_size
+
+        # This part of your model (the shared backbone) is correct.
+        x = x.unfold(2, patch_h, patch_h).unfold(3, patch_w, patch_w)
+        x = x.contiguous().view(N, -1, C * patch_h * patch_w)
+        x = self.patch_embedding(x)
+        cls_tokens = self.cls_token.expand(N, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.positional_encoding
+        x = self.transformer_encoder(x)
+
+        # Extract the CLS token output to feed into the heads
+        cls_output = x[:, 0]
+
+        pred_rot_reg = self.head_rot_reg(cls_output)
+
+        return  pred_rot_reg
 
 
+class QMDataset(Dataset):
+    def __init__(self, df):
+        self.xyz = [
+            torch.tensor(arr, dtype=torch.float32) 
+            for arr in tqdm(df['xyz'], desc="Processing molecules")
+        ]
+ 
+        rots_np = np.vstack(df['rotation'].values).astype(float)
+        self.y_rot_reg = torch.tensor(rots_np, dtype=torch.float32)
 
-# Accuracy and Metrics Calculation
-def evaluate_model(model, test_loader, criterion, task, test):
+    def __len__(self):
+        return len(self.xyz)
+        
+    def __getitem__(self, idx):
+        x_unpadded = self.xyz[idx]
+        padded_x = torch.zeros(27, 8, dtype=torch.float32)
+        padded_x[:x_unpadded.shape[0], :] = x_unpadded
+        
+        return (
+            padded_x, 
+            self.y_rot_reg[idx]
+        )
+def run_validation(model, train_df, val_indices, device, loaded_scaler_x, loaded_scaler_y, fold, epoch, test=False, output_filepath="test"):
+    if not test:
+        fold_val_df = train_df.iloc[val_indices]
+    else:
+        fold_val_df = train_df
+    print(f" Validation subset size: {len(fold_val_df)}")
+
     model.eval()
-    all_labels = []
-    all_predictions = []
-    running_loss = 0.0
 
+    all_preds = []
+    all_trues = []
+
+    val_ds = QMDataset(fold_val_df)
+    validation_loader = DataLoader(
+        val_ds,
+        batch_size=256,
+        shuffle=True,
+        collate_fn=lambda batch: custom_collate_fn(batch, loaded_scaler_x, loaded_scaler_y, device=device)
+    )
+    # 1. Gather all predictions and true labels from the validation set
     with torch.no_grad():
-        for data, labels in test_loader:
-            data, labels = data.to(device), labels.to(device)
+        loop = tqdm(validation_loader, desc=f"Fold {fold+1} Validation", unit="batch", leave=False)
+        for X_encoded, y_encoded in loop:
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == 'cuda')):
+                logits = model(X_encoded)
+            
+            batch_preds = torch.cat([logits], dim=1)
+            
+            all_preds.append(batch_preds.cpu())
+            all_trues.append(y_encoded.cpu())
 
-            # Reshape to Nx1x27x8 for CNN
-            data = data.unsqueeze(1)  # Add channel dimension
+    all_preds_tensor = torch.cat(all_preds, dim=0)
+    all_trues_tensor = torch.cat(all_trues, dim=0)
 
-            outputs = model(data)
+    decoded_preds_tensor = scaler_y_decode(loaded_scaler_y[0], loaded_scaler_y[1], all_preds_tensor)
+    decoded_trues_tensor = scaler_y_decode(loaded_scaler_y[0], loaded_scaler_y[1], all_trues_tensor)
 
-            if task == 2:
-                loss = criterion(outputs, labels.long())
-                predictions = torch.argmax(outputs, dim=1)
-            else:
-                # Binary classification
-                outputs = torch.sigmoid(outputs)
-                
-                # Ensure the output and labels have the same shape
-                outputs = outputs.view(-1)  # Flatten model output to match labels
-                labels = labels.view(-1)   # Flatten labels for consistency
-                
-                loss = criterion(outputs, labels)
-                predictions = (outputs > 0.5).float()
-
-            running_loss += loss.item()
-            all_predictions.extend(predictions.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    avg_loss = running_loss / len(test_loader)
-    accuracy = (np.array(all_predictions) == np.array(all_labels)).mean() * 100
-    average_type = 'macro' if task == 2 else 'binary'
-    precision = precision_score(all_labels, all_predictions, average=average_type, zero_division=0)
-    recall = recall_score(all_labels, all_predictions, average=average_type, zero_division=0)
-    f1 = f1_score(all_labels, all_predictions, average=average_type, zero_division=0)
-    if test:
-        cm = confusion_matrix(all_labels, all_predictions)
-        print("\nConfusion Matrix:")
-        print(cm)
-    return avg_loss, accuracy, precision, recall, f1
-
-# Main Training Function
-def train_model(train_data, val_data, test_data, task, num_epochs=50, batch_size=8, learning_rate=0.0001):
-    # Unpack and normalize data
-    train_idx, train_xyz, _, _ = train_data
-    val_idx, val_xyz, _, _ = val_data
-    test_idx, test_xyz, _, _ = test_data
-
-    min_val, max_val, train_xyz = normalize_xyz_train(train_xyz)
-    val_xyz = apply_normalization(val_xyz, min_val, max_val)
-    test_xyz = apply_normalization(test_xyz, min_val, max_val)
+    decoded_preds = decoded_preds_tensor.numpy()
+    decoded_trues = decoded_trues_tensor.numpy()
 
 
+    rot_0_mae = mean_absolute_error(decoded_trues[:, 0], decoded_preds[:, 0])
+    rot_1_mae = mean_absolute_error(decoded_trues[:, 1], decoded_preds[:, 1])
+    rot_2_mae = mean_absolute_error(decoded_trues[:, 2], decoded_preds[:, 2])
+   
+    absolute_errors_total = np.abs(decoded_trues - decoded_preds).flatten()
+    error_dist_total = {
+        "mean": np.mean(absolute_errors_total),
+        "median": np.median(absolute_errors_total),
+        "iqr": np.percentile(absolute_errors_total, 75) - np.percentile(absolute_errors_total, 25)
+    }
 
-    # Convert to tensors
-    train_labels = torch.tensor(generate_label_array(train_idx, [], train_data[2], train_data[3], task), dtype=torch.float32)
-    val_labels = torch.tensor(generate_label_array(val_idx, [], val_data[2], val_data[3], task), dtype=torch.float32)
-    test_labels = torch.tensor(generate_label_array(test_idx, [], test_data[2], test_data[3], task), dtype=torch.float32)
+    results_per_threshold = []
 
-
-    train_tensor = torch.tensor(np.array(train_xyz), dtype=torch.float32)
-    val_tensor = torch.tensor(np.array(val_xyz), dtype=torch.float32)
-    test_tensor = torch.tensor(np.array(test_xyz), dtype=torch.float32)
-
-
-    train_tensor = train_tensor.view(train_tensor.size(0), -1)  # Shape: (N, 27*3)
-    val_tensor = val_tensor.view(val_tensor.size(0), -1)
-    test_tensor = test_tensor.view(test_tensor.size(0), -1)
-
-
-    train_dataset = TensorDataset(train_tensor, train_labels)
-    val_dataset = TensorDataset(val_tensor, val_labels)
-    test_dataset = TensorDataset(test_tensor, test_labels)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    # Model setup
-    input_size = train_tensor.shape[1]
-    output_size = 5 if task == 2 else 1
-    model = FFNN(input_size, 256, output_size).to(device)
-
-    criterion = nn.CrossEntropyLoss() if task == 2 else nn.BCEWithLogitsLoss()
+    y_pred_binary = (decoded_preds > 0).astype(int)
+    y_true_binary = (decoded_trues > 0).astype(int)
     
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+ 
 
-    # Training loop
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
+    cm_rot0 = confusion_matrix(y_true_binary[:, 0], y_pred_binary[:, 0], labels=[0, 1])
+    cm_rot1 = confusion_matrix(y_true_binary[:, 1], y_pred_binary[:, 1], labels=[0, 1])
+    cm_rot2 = confusion_matrix(y_true_binary[:, 2], y_pred_binary[:, 2], labels=[0, 1])
 
-        for data, labels in train_loader:
-            data, labels = data.to(device), labels.to(device)
-            optimizer.zero_grad()
+    print("cm_rot0:\n",cm_rot0)
+    print("cm_rot1:\n",cm_rot1)
+    print("cm_rot2:\n",cm_rot2)
+    print(f"rot0: {accuracy_score(y_true_binary[:, 0].flatten(), y_pred_binary[:, 0].flatten()):.4f}")
+    print(f"rot1: {accuracy_score(y_true_binary[:, 1].flatten(), y_pred_binary[:, 1].flatten()):.4f}")
+    print(f"rot2: {accuracy_score(y_true_binary[:, 2].flatten(), y_pred_binary[:, 2].flatten()):.4f}")
 
-            outputs = model(data)
-            loss = criterion(outputs.squeeze(), labels)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item()
 
-        # Evaluation on validation data
-        val_loss, val_acc, val_prec, val_recall, val_f1 = evaluate_model(model, val_loader, criterion, task, test=False)
+    validation_output = {
+        "fold": fold + 1,
+        "epoch": epoch,
+        "regression_metrics": {
+  
+            "rot_0_MAE": rot_0_mae,
+            "rot_1_MAE": rot_1_mae,
+            "rot_2_MAE": rot_2_mae
+        },
+        "error_distribution": {
+            "total": error_dist_total
+        },
+        "threshold_analysis": results_per_threshold,
+        "distributions": {
+            "true_total": decoded_trues.flatten().tolist(), "true_rot0": decoded_trues[:, 0].tolist(),
+            "true_rot1": decoded_trues[:, 1].tolist(), "true_rot2": decoded_trues[:, 2].tolist(),
+            "pred_total": decoded_preds.flatten().tolist(), "pred_rot0": decoded_preds[:, 0].tolist(),
+            "pred_rot1": decoded_preds[:, 1].tolist(), "pred_rot2": decoded_preds[:, 2].tolist()
+        }
+    }
 
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(train_loader):.4f}, Val Loss: {val_loss:.4f}, Val F1: {val_f1:.4f}")
 
-    # Final Test Evaluation
-    test_loss, test_acc, test_prec, test_recall, test_f1 = evaluate_model(model, test_loader, criterion, task, test=True)
-    print(f"Final Test Loss: {test_loss:.4f}, Accuracy: {test_acc:.2f}%, Precision: {test_prec:.4f}, Recall: {test_recall:.4f}, F1: {test_f1:.4f}")
-    return model
 
-# Load and preprocess data
-index_array, inchi_array, xyz_arrays, chiral_centers_array, rotation_array = npy_preprocessor('qm9_filtered.npy')
-if task == 3 or task == 4 or task == 5:
-    #print distribution of labels as a ratio
-    print("Distribution of Labels:")
-    print(pd.Series(generate_label_array(index_array, xyz_arrays, chiral_centers_array, rotation_array, task)).value_counts(normalize=True))
+    return validation_output
 
-# shell arg for task
-task = int(sys.argv[1])
 
-print("\nTASK:", task)
-device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(device)
-filtered_index, filtered_xyz, filtered_chiral, filtered_rotation = filter_data(index_array, xyz_arrays, chiral_centers_array, rotation_array, task)
-train_data, val_data, test_data = split_data(filtered_index, filtered_xyz, filtered_chiral, filtered_rotation)
+def custom_collate_fn(batch, scaler_x_continuous, scaler_y, device):
+    X_samples, y_samples = zip(*batch)
+    
+    X_batch_unscaled = torch.stack(X_samples, dim=0)
+    y_batch_unscaled = torch.stack(y_samples, dim=0)
 
-model = train_model(train_data, val_data,  test_data, num_epochs=1, task=task)
+
+    X_continuous = X_batch_unscaled[..., :3] 
+    X_categorical = X_batch_unscaled[..., 3:] 
+    # turn on to remove one hot encoding
+
+    # X_categorical = torch.ones_like(X_categorical)
+   
+    original_shape = X_continuous.shape
+    reshaped_X_continuous = X_continuous.reshape(-1, 3)
+    scaled_X_continuous_flat = scaler_x_encode(scaler_x_continuous[0], scaler_x_continuous[1], reshaped_X_continuous)
+    scaled_X_continuous = scaled_X_continuous_flat.reshape(original_shape)
+    scaled_X_tensor = torch.cat([scaled_X_continuous, X_categorical], dim=-1).float()
+    scaled_Y_tensor = scaler_y_encode(scaler_y[0], scaler_y[1], y_batch_unscaled).float()
+    
+    scaled_X_tensor = scaled_X_tensor.unsqueeze(1)  # Inserts C=1 at dim 1 (N, C, H, W)
+    
+    return scaled_X_tensor.to(device, non_blocking=True), scaled_Y_tensor.to(device, non_blocking=True)
+
+def run_training_epoch(model, current_train_df, optimizer, scaler,
+                         loaded_scaler_x, loaded_scaler_y, device, desc, num_epochs, warmup_epochs,batch_size =128):
+
+    augmented_dfs =  augmented_dataset(current_train_df)
+    train_df_augmented_fold = augmented_dfs
+
+    train_ds = QMDataset(train_df_augmented_fold)
+
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=batch_size, 
+        shuffle=True,
+        collate_fn=lambda batch: custom_collate_fn(batch, loaded_scaler_x, loaded_scaler_y, device=device)
+    )
+    num_training_steps = num_epochs * len(train_loader)
+    num_warmup_steps = warmup_epochs * len(train_loader)
+    # Warmup phase
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=num_warmup_steps
+    )
+    # Decay phase
+    decay_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1.0, end_factor=0.0, total_iters=(num_training_steps - num_warmup_steps)
+    )
+    
+    # Combine them sequentially
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[num_warmup_steps]
+    )
+    criterion =  torch.nn.HuberLoss(reduction='mean', delta=1)
+
+
+
+    model.train()
+    total_train_loss = 0.0
+    
+    loop = tqdm(train_loader, desc=desc, unit="batch")
+    
+    for X_encoded, y_encoded in loop:
+        X_encoded, y_encoded = X_encoded.to(device), y_encoded.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == 'cuda')):
+            logits = model(X_encoded)
+            
+        
+            loss =  criterion(logits, y_encoded)
+        # Perform the backward pass and update the optimizer step outside of autocast
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        scheduler.step()
+
+        batch_loss = loss.detach().item()
+        total_train_loss += batch_loss * len(X_encoded)
+        loop.set_postfix(loss=f"{batch_loss:.4f}")
+        
+
+    return total_train_loss / len(train_loader.dataset)
+
+
+def main():
+    output_filepath = sys.argv[1]
+    filename    = 'qm9_filtered.npy'
+
+    device      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    df       = npy_preprocessor(filename)
+    sub_df = df[df['chiral_centers'].apply(len) == 1]
+    
+
+    train_df, test_df = train_test_split(sub_df, test_size=0.2, random_state=42)
+    rest_df = df[df['chiral_centers'].apply(len) != 1]
+    
+    train_df = pd.concat([sub_df, rest_df], ignore_index=False)
+    
+    print(df.head())
+ 
+    train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+
+    outlier(df, filter_z=1, output_path="scalar_all_stats.json")
+    outliers_in_train = outlier(train_df, filter_z=1, output_path="scalar_train_stats.json", null=False)
+
+    df_for_scaling = train_df.drop(index=outliers_in_train) 
+
+    scale_ds = QMDataset(df_for_scaling)
+    scale_loader = DataLoader(scale_ds, batch_size=128) 
+    
+    print("\nCollecting all training samples to fit scalers...")
+    all_x_for_scaling = []
+    all_y_for_scaling = []
+    for x_batch, y_batch in scale_loader:
+        all_x_for_scaling.extend([x for x in x_batch])
+        all_y_for_scaling.extend([y for y in y_batch])
+    print(f"Collected {len(all_x_for_scaling)} samples.")
+    
+
+    loaded_scaler_x = init_scaler_x(all_x_for_scaling) # Returns (mean, std)
+    loaded_scaler_y = init_scaler_y(all_y_for_scaling) # Returns (mean, std)
+
+ 
+
+
+
+    print("\nVerifying loaded scalers by checking their learned means:")
+    print("Loaded Scaler X Mean:  ", loaded_scaler_x[0])
+    print("Loaded Scaler X STD:  ", loaded_scaler_x[1])
+    print("Loaded Scaler Y Mean:  ", loaded_scaler_y[0])
+    print("Loaded Scaler Y STD:  ", loaded_scaler_y[1])
+    
+
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(device)
+
+
+
+    NUM_EPOCHS = 1
+    WARMUP_EPOCHS = 0
+    LEARNING_RATE = 1e-4 # A good starting point for AdamW
+    WEIGHT_DECAY = 1e-2  # A common value for AdamW
+    img_shape=(27, 8)
+    patch_size=(1, 8)
+    embed_dim=1024      
+    num_layers=4      
+    nhead=64         
+    dropout_rate=0.2
+    batch_size = 64
+    scaler = torch.amp.GradScaler(enabled=(device.type == 'cuda'))
+
+
+    final_model = ViTMultiHead(
+                    img_shape=img_shape,
+                    patch_size=patch_size,
+                    embed_dim=embed_dim,       
+                    num_layers=num_layers,       
+                    nhead=nhead,            
+                    dropout_rate=dropout_rate
+                ).to(device)
+
+    optimizer = optim.AdamW(final_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    for epoch in range(1, NUM_EPOCHS + 1):
+
+        desc = f"Final Training, Epoch {epoch}/{NUM_EPOCHS}"
+        avg_final_train_loss = run_training_epoch(
+                model=final_model,
+                current_train_df=train_df,
+                optimizer=optimizer,
+                scaler=scaler,
+                loaded_scaler_x=loaded_scaler_x,
+                loaded_scaler_y=loaded_scaler_y,
+                device=device,
+                desc=desc,
+                num_epochs=NUM_EPOCHS,
+                warmup_epochs=WARMUP_EPOCHS, 
+                batch_size =batch_size
+            )
+        print(f"Final Training Epoch {epoch}: Average Training Loss = {avg_final_train_loss:.4f}")
+
+    test_output = run_validation(final_model, test_df,  [], device, loaded_scaler_x, loaded_scaler_y, 0, 0, test=True,output_filepath=output_filepath)
+    print("Testing complete.")
+    plot_3d_scatter(test_output,output_filepath)
+ 
+if __name__ == "__main__":
+    main()
+
+
