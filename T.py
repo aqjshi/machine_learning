@@ -42,6 +42,8 @@ def augment_data(X_train, y_train, num_samples, rotate_molecule_func):
     
     print("Augmentation complete.")
     return X_augmented, y_augmented
+
+
 class QMDataModule(pl.LightningDataModule):
     def __init__(self, X, y, batch_size=64, augment=False, num_aug_samples=1_000_000):
         super().__init__()
@@ -141,10 +143,43 @@ class ViTModule(pl.LightningModule):
         self.log('test/loss', loss, on_epoch=True)
         self.log('test/acc', self.test_acc, on_epoch=True)
         return loss
+
     def configure_optimizers(self):
- 
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
-        return optimizer
+        
+        EPOCHS = self.trainer.max_epochs 
+        decay_start_epoch = int(EPOCHS * 1 / 2) 
+    
+        scheduler_initial = LinearLR(
+            optimizer, 
+            start_factor=1.0, 
+            end_factor=1.0, 
+            total_iters=decay_start_epoch
+        )
+        
+    
+        scheduler_decay = LinearLR(
+            optimizer, 
+            start_factor=1.0, 
+            end_factor=0.1, 
+            total_iters=decay_start_epoch
+        )
+
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[scheduler_initial, scheduler_decay],
+            milestones=[decay_start_epoch]
+        )
+        
+        
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'epoch',
+                'frequency': 1,
+            }
+        }
 def find_optimal_lr(model: pl.LightningModule, datamodule: pl.LightningDataModule):
     
     # We use a temporary trainer for the finder, as it doesn't need logging or callbacks.
@@ -173,14 +208,15 @@ def find_optimal_lr(model: pl.LightningModule, datamodule: pl.LightningDataModul
 
 def main():
     pl.seed_everything(42)
-    TASK = 3
+    TASK = 0
 
     EPOCHS = 20
     BATCH_SIZE = 256
     AUGMENT_DATA = True
     
     df = npy_preprocessor("qm9_filtered.npy")
-    # df = df[df['chiral_centers'].apply(len)==1]
+    if TASK == 1:
+        df = df[df['chiral_centers'].apply(len)==1]
 
     X = df['xyz'].values 
 
@@ -192,15 +228,16 @@ def main():
 
     # optimal_lr = find_optimal_lr(model, data_module)
     # 4e-05 precalculated
-    optimal_lr =4e-05 
-    # Update the model's hyperparameters with the found LR before training
+    optimal_lr = 1e-04
+
+
     model.hparams.learning_rate = optimal_lr
 
 
     trainer = pl.Trainer(
         max_epochs=EPOCHS,
         accelerator='auto',
-        logger=WandbLogger(project="ViT-Replication-QM9", name=f"yujun_all_bs64_emb216_lrfound{optimal_lr:.2e}"),
+        logger=WandbLogger(project="ViT-Replication-QM9", name=f"yujun_TASK{TASK}_bs{BATCH_SIZE}_emb216_lr{optimal_lr:.2e}_decay_aug{AUGMENT_DATA}"),
         callbacks=[LearningRateMonitor(logging_interval='step')]
     )
     
@@ -210,3 +247,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
