@@ -1,334 +1,198 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, confusion_matrix
-import torch.nn.functional as F
-import sys
+from torch import nn
 import pandas as pd
+from torch.utils.data import DataLoader, Dataset, random_split
+from sklearn.model_selection import train_test_split
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import LearningRateMonitor
+from torchmetrics import Accuracy, MeanAbsoluteError
+from tqdm import tqdm
+import numpy as np
+from pytorch_lightning.loggers import WandbLogger
+import wandb
+from sklearn.metrics import accuracy_score, f1_score
+import plotly.graph_objects as go
+from models import npy_preprocessor
+from eda import outlier, augmented_dataset, QMDataset
+from ViT_yunjun import ViT, rotate_molecule, MoleculeSequenceDataset, get_data
+from torch.optim.lr_scheduler import LinearLR, SequentialLR, ExponentialLR, ReduceLROnPlateau, CosineAnnealingLR
+import os
+from pytorch_lightning.tuner import Tuner
 
-# implementation "https://arxiv.org/pdf/2112.01898" linear algebra transformer
-def read_data(filename):
-    data = np.load(filename, allow_pickle=True)
-    df = pd.DataFrame(data.tolist() if data.dtype == 'O' and isinstance(data[0], dict) else data)
-    return df
 
 
-def npy_preprocessor(filename):
-    df = read_data(filename)
-    return df['index'].values, df['inchi'].values, df['xyz'].values, df['chiral_centers'].values, df['rotation'].values
+class QMDataModule(pl.LightningDataModule):
+    def __init__(self, X, y, batch_size=64, augment=False, num_aug_samples=1_000_000):
+        super().__init__()
+        self.X = X
+        self.y = y
+        self.batch_size = batch_size
+        self.augment = augment
+        self.num_aug_samples = num_aug_samples
 
+    def setup(self, stage=None):
+        X_train_val, X_test, y_train_val, y_test = train_test_split(
+            self.X, self.y, test_size=0.2, random_state=43, stratify=self.y
+        )
 
-def filter_data(index_array, xyz_arrays, chiral_centers_array, rotation_array, task):
-    if task == 0:
-        filtered_indices = [i for i in range(len(index_array))]
-        filtered_index_array = [index_array[i] for i in filtered_indices]
-        filtered_xyz_arrays = [xyz_arrays[i] for i in filtered_indices]
-        filtered_chiral_centers_array = [chiral_centers_array[i] for i in filtered_indices]
-        filtered_rotation_array = [rotation_array[i] for i in filtered_indices]
-        return filtered_index_array, filtered_xyz_arrays, filtered_chiral_centers_array, filtered_rotation_array
-
-    if task == 1:
-        #return only chiral_length <2
-        filtered_indices = [i for i in range(len(index_array)) if len(chiral_centers_array[i]) < 2]
-        filtered_index_array = [index_array[i] for i in filtered_indices]
-        filtered_xyz_arrays = [xyz_arrays[i] for i in filtered_indices]
-        filtered_chiral_centers_array = [chiral_centers_array[i] for i in filtered_indices]
-        filtered_rotation_array = [rotation_array[i] for i in filtered_indices]
-        return filtered_index_array, filtered_xyz_arrays, filtered_chiral_centers_array, filtered_rotation_array
-
-    elif task == 2:
-        #only return chiral legnth < 5
-        filtered_indices = [i for i in range(len(index_array)) if len(chiral_centers_array[i]) < 5]
-        filtered_index_array = [index_array[i] for i in filtered_indices]
-        filtered_xyz_arrays = [xyz_arrays[i] for i in filtered_indices]
-        filtered_chiral_centers_array = [chiral_centers_array[i] for i in filtered_indices]
-        filtered_rotation_array = [rotation_array[i] for i in filtered_indices]
-        return filtered_index_array, filtered_xyz_arrays, filtered_chiral_centers_array, filtered_rotation_array
-    elif task == 3: 
-        # Step 1: Filter indices where the length of chiral_centers_array is exactly 1 and the first tuple contains 'R' or 'S'
-        filtered_indices = [i for i in range(len(index_array)) if len(chiral_centers_array[i]) == 1 and ('R' == chiral_centers_array[i][0][1] or 'S' == chiral_centers_array[i][0][1])]
-        # Step 2: Create filtered arrays for index_array, xyz_arrays, chiral_centers_array, and rotation_array
-        filtered_index_array = [index_array[i] for i in filtered_indices]
-        filtered_xyz_arrays = [xyz_arrays[i] for i in filtered_indices]
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train_val, y_train_val, test_size=0.1, random_state=43, stratify=y_train_val
+        )
         
-        filtered_chiral_centers_array = [chiral_centers_array[i] for i in filtered_indices]
+
+        if self.augment:
+            print(f"Generating {self.num_aug_samples} augmented samples...")
+            rotated_X, rotated_y = [], []
+            original_num_samples = len(X_train)
+            
+            # Use tqdm for a progress bar
+            for _ in tqdm(range(self.num_aug_samples), desc="Augmenting data"):
+                idx = np.random.randint(0, original_num_samples)
+                angle = np.random.uniform(0, 2 * np.pi)
+                axis = np.random.choice(['x', 'y', 'z'])
+                aug_molecule = rotate_molecule(X_train[idx], angle, axis=axis)
+                rotated_X.append(aug_molecule)
+                rotated_y.append(y_train[idx])
+            
+            X_train = np.concatenate((X_train, np.array(rotated_X)), axis=0)
+            y_train = np.concatenate((y_train, np.array(rotated_y)), axis=0)
+            print("Augmentation complete.")
+
+        # Create the final datasets
+        self.train_dataset = MoleculeSequenceDataset(X_train, y_train)
+        self.val_dataset = MoleculeSequenceDataset(X_val, y_val)
+        self.test_dataset = MoleculeSequenceDataset(X_test, y_test)
+
+
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=0)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset, batch_size=self.batch_size * 2, num_workers=0)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, batch_size=self.batch_size * 2, num_workers=0)
+
+class ViTModule(pl.LightningModule):
+    def __init__(self, learning_rate):
+        super().__init__()
+        self.save_hyperparameters()
+        self.model = ViT(embedding_dim=216, num_classes=2)
         
-        # Step 5: Filter the rotation_array accordingly
-        filtered_rotation_array = [rotation_array[i] for i in filtered_indices]
-        return filtered_index_array, filtered_xyz_arrays, filtered_chiral_centers_array, filtered_rotation_array
+        self.criterion = nn.CrossEntropyLoss()
     
-    elif task == 4:
-        # only return chiral_length == 1
-        filtered_indices = [i for i in range(len(index_array)) if len(chiral_centers_array[i]) == 1]
-        filtered_index_array = [index_array[i] for i in filtered_indices]
-        filtered_xyz_arrays = [xyz_arrays[i] for i in filtered_indices]
-        filtered_chiral_centers_array = [chiral_centers_array[i] for i in filtered_indices]
-        filtered_rotation_array = [rotation_array[i] for i in filtered_indices]
-        return filtered_index_array, filtered_xyz_arrays, filtered_chiral_centers_array, filtered_rotation_array
-    elif task == 5:
-        filtered_indices = [i for i in range(len(index_array))]
-        filtered_index_array = [index_array[i] for i in filtered_indices]
-        filtered_xyz_arrays = [xyz_arrays[i] for i in filtered_indices]
-        filtered_chiral_centers_array = [chiral_centers_array[i] for i in filtered_indices]
-        filtered_rotation_array = [rotation_array[i] for i in filtered_indices]
-        return filtered_index_array, filtered_xyz_arrays, filtered_chiral_centers_array, filtered_rotation_array
+        self.train_acc = Accuracy(task="multiclass", num_classes=2)
+        self.val_acc = Accuracy(task="multiclass", num_classes=2)
+        self.test_acc = Accuracy(task="multiclass", num_classes=2)
 
+        self.validation_step_outputs = []
 
-def generate_label(index_array, xyz_arrays, chiral_centers_array, rotation_array, task):
-    # Task 0 or Task 1: Binary classification based on the presence of chiral centers
-    if task == 0 or task == 1:
-        return [1 if len(chiral_centers) > 0 else 0 for chiral_centers in chiral_centers_array]
-    
-    # Task 2: Return the number of chiral centers
-    elif task == 2:
-        return [len(chiral_centers) for chiral_centers in chiral_centers_array]
-    
-    # Task 3: Assuming that the task is to return something from chiral_centers_array, not rotation_array
-    elif task == 3:
-        return [1 if 'R' == chiral_centers[0][1] else 0 for chiral_centers in chiral_centers_array]
-    
-    # Task 4 or Task 5: Binary classification based on posneg value in rotation_array
-    elif task == 4 or task == 5:
-        return [1 if posneg[0] > 0 else 0 for posneg in rotation_array]
-
-def generate_label_array(index_array, xyz_arrays, chiral_centers_array, rotation_array, task):
-    # Fix to directly return the output of generate_label
-    return generate_label(index_array, xyz_arrays, chiral_centers_array, rotation_array, task)
-
-# 121416 item, each associated with a 27 row, 8 col matrix, apply global normalization to col 0,1,2 Rescaling data to a [0, 1]
-
-def reflect_wrt_plane(xyz, plane_normal=[0, 0, 1]):
-    plane_normal = plane_normal / np.linalg.norm(plane_normal)
-    d = np.dot(xyz, plane_normal)
-    return xyz - 2 * np.outer(d, plane_normal)
-
-def rotate_xyz(xyz, angles):
-    theta_x, theta_y, theta_z = np.radians(angles)
-    Rx = np.array([[1,0,0],
-                   [0,np.cos(theta_x),-np.sin(theta_x)],
-                   [0,np.sin(theta_x), np.cos(theta_x)]])
-    Ry = np.array([[ np.cos(theta_y),0,np.sin(theta_y)],
-                   [0,1,0],
-                   [-np.sin(theta_y),0,np.cos(theta_y)]])
-    Rz = np.array([[np.cos(theta_z),-np.sin(theta_z),0],
-                   [np.sin(theta_z), np.cos(theta_z),0],
-                   [0,0,1]])
-    R = Rz @ Ry @ Rx
-    return np.dot(xyz, R.T)
-
-def split_data(index_array, xyz_arrays, chiral_centers_array, rotation_array):
-    train_idx, test_idx = train_test_split(range(len(index_array)), test_size=0.1, random_state=42)
-    train_idx, val_idx = train_test_split(train_idx, test_size=0.05, random_state=42)
-
-    def subset(indices):
-        return ([index_array[i] for i in indices],
-                [xyz_arrays[i] for i in indices],
-                [chiral_centers_array[i] for i in indices],
-                [rotation_array[i] for i in indices])
-    return subset(train_idx), subset(val_idx), subset(test_idx)
-
-def normalize_xyz_train(xyz_arrays):
-    x_array = np.array([xyz[:,0] for xyz in xyz_arrays])
-    y_array = np.array([xyz[:,1] for xyz in xyz_arrays])
-    z_array = np.array([xyz[:,2] for xyz in xyz_arrays])
-    min_val = min(np.min(x_array), np.min(y_array), np.min(z_array))
-    max_val = max(np.max(x_array), np.max(y_array), np.max(z_array))
-    return min_val, max_val, [((xyz[:,:3]-min_val)/(max_val-min_val)) for xyz in xyz_arrays]
-
-def apply_normalization(xyz_arrays, min_val, max_val):
-    return [((xyz[:,:3]-min_val)/(max_val-min_val)) for xyz in xyz_arrays]
-
-def augment_dataset(index_array, xyz_arrays, chiral_centers_array, rotation_array, label_array, task):
-    aug_idx, aug_xyz, aug_chiral, aug_rot, aug_label = list(index_array), list(xyz_arrays), list(chiral_centers_array), list(rotation_array), list(label_array)
-    for i in range(len(index_array)):
-        if len(chiral_centers_array[i]) == 1:
-            reflected_xyz = xyz_arrays[i].copy()
-            reflected_xyz[:, :3] = reflect_wrt_plane(xyz_arrays[i][:, :3], [0,0,1])
-            reflected_label = label_array[i]
-            if task == 3: reflected_label = 1 - reflected_label
-            elif task in [4,5]: reflected_label = -reflected_label
-            aug_idx.append(index_array[i])
-            aug_xyz.append(reflected_xyz)
-            aug_chiral.append(chiral_centers_array[i])
-            aug_rot.append(rotation_array[i])
-            aug_label.append(reflected_label)
-    return aug_idx, aug_xyz, aug_chiral, aug_rot, aug_label
-
-# take in argument from shell task
-task = int(sys.argv[1])
-
-device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
-
-class TransformerClassifier(nn.Module):
-    def __init__(self, input_size, num_heads, num_layers, hidden_size, output_size):
-        super(TransformerClassifier, self).__init__()
-        # input_size should match the number of features per token, which is 4 in this case
-        self.embedding = nn.Linear(input_size, hidden_size)
-        self.positional_encoding = nn.Parameter(torch.randn(1, 100, hidden_size))  # Assume 32 max tokens here, update based on your data
-        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_size, nhead=num_heads, dim_feedforward=512, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        self.fc_out = nn.Linear(hidden_size, output_size)
-    
     def forward(self, x):
-        if x.size(-1) != self.embedding.in_features:
-            # print("unmatched")
-            x = x.transpose(1, 2)
+        return self.model(x)
 
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        loss = self.criterion(logits, y)
         
-        # Ensure positional encoding matches the input size dynamically
-        seq_len = x.size(1)  # Get the sequence length (number of tokens/features)
-        pos_encoding = self.positional_encoding[:, :seq_len, :]  # Adjust positional encoding to the input size
-        x = self.embedding(x) + pos_encoding
-        x = self.transformer_encoder(x)
-        x = torch.mean(x, dim=1)  # Pooling over sequence dimension
-        x = self.fc_out(x)
-        return x
+        preds = torch.argmax(logits, dim=1)
+        self.train_acc(preds, y)
+        
+        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train/acc', self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
+        return loss
 
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        loss = self.criterion(logits, y)
+        
+        preds = torch.argmax(logits, dim=1)
+        self.val_acc(preds, y)
 
-
-task = 3  # Change this variable to switch between tasks
-
-# Load and process data
-index_array, inchi_array, xyz_arrays, chiral_centers_array, rotation_array = npy_preprocessor('qm9_filtered.npy')
-
-index_array, xyz_arrays, chiral_centers_array, rotation_array = filter_data(index_array, xyz_arrays, chiral_centers_array, rotation_array, task)
-
-# print(xyz_arrays[0])
-xyz_arrays = np.array([np.array(x) for x in xyz_arrays], dtype=np.float32)
-
-print(f"Number of samples {xyz_arrays.shape[0]} Size of each sample {xyz_arrays.shape[1]}  number of features {xyz_arrays.shape[2]}")
-
-total_elements = xyz_arrays.shape[0] * xyz_arrays.shape[1] * xyz_arrays.shape[2] # 2481084 elements
-samples = xyz_arrays.shape[0] # Number of samples
-sequence_length = xyz_arrays.shape[1]  # Number of tokens/features
-num_features = xyz_arrays.shape[2]  # Number of features
-
-xyz_arrays = xyz_arrays.reshape(samples, sequence_length, num_features)
-
-
-# Generate appropriate classification labels (binary or multi-class)
-label_array = generate_label_array(index_array, xyz_arrays, chiral_centers_array, rotation_array, task)
-
-# Convert labels to a tensor
-label_array = torch.tensor(label_array, dtype=torch.float32 if task != 2 else torch.long)
-
-# Split the original data before augmentation
-train_size = int(0.9 * len(xyz_array))
-test_size = len(xyz_array) - train_size
-train_xyz, test_xyz, train_labels, test_labels = train_test_split(xyz_arrays, label_array, test_size=test_size, train_size=train_size)
-
-# Augment the training dataset
-train_xyz_augmented, train_labels_augmented = augment_dataset(train_xyz, train_labels,task=task)
-
-print(f'Train size: {train_xyz_augmented.shape[0]}, Test size: {test_xyz.shape[0]}')  
-
-# Convert to tensors
-train_xyz_tensor = torch.tensor(train_xyz_augmented, dtype=torch.float32)
-train_labels_tensor = torch.tensor(train_labels_augmented)
-test_xyz_tensor = torch.tensor(test_xyz, dtype=torch.float32)
-test_labels_tensor = torch.tensor(test_labels)
-
-# Create DataLoader for training
-train_dataset = TensorDataset(train_xyz_tensor, train_labels_tensor)
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-
-# Hyperparameters
-input_size = train_xyz.shape[1]  # Number of features
-learning_rate = 0.0001
-num_epochs = 250
-
-# Initialize the Transformer model
-hidden_size = 256
-num_heads = 16
-num_layers = 2
-output_size = 5 if task == 2 else 1  # 5-class for task 2, binary otherwise
-
-# Correct: This sets input_size to the number of features per token
-
-
-model = TransformerClassifier(
-    input_size=input_size,  # Now correctly set to 4
-    num_heads=num_heads,
-    num_layers=num_layers,
-    hidden_size=hidden_size,
-    output_size=output_size
-).to(device)
-
-
-
-
-
-if task == 2:
-    criterion = nn.CrossEntropyLoss()
-else:
-    criterion = nn.BCEWithLogitsLoss()
-
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-
-# Training loop
-# Open the log file in write mode
-with open("log.txt", "a") as log_file:
-    for epoch in range(num_epochs):
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
-
-            # Forward pass
-            outputs = model(data)
-
-            if task == 2:
-                loss = criterion(outputs, target)
-            else:
-                loss = criterion(outputs.squeeze(), target)
-
-            # Backward pass and optimize
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        # Log the loss for this epoch to both the console and the file
-        log_line = f'TASK {task} Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}\n'
-        print(log_line)
-        log_file.write(log_line)
+        self.log('val/loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('val/acc', self.val_acc, on_epoch=True)
+        self.validation_step_outputs.append({'preds': preds, 'labels': y})
+        return loss
     
-        # Evaluate the model every 5 epochs and log the results
-        if (epoch+1) % 5 == 0:
-            model.eval()
-            with torch.no_grad():
-                test_outputs = model(test_xyz_tensor.to(device)).squeeze()
+    def on_validation_epoch_end(self):
+   
+        all_preds = torch.cat([x['preds'] for x in self.validation_step_outputs]).cpu().numpy()
+        all_labels = torch.cat([x['labels'] for x in self.validation_step_outputs]).cpu().numpy()
+        
+        f1 = f1_score(all_labels, all_preds, average='weighted')
+        self.log('val/f1_score', f1)
+        self.validation_step_outputs.clear()
+    def test_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        loss = self.criterion(logits, y)
+        
+        preds = torch.argmax(logits, dim=1)
+        self.test_acc(preds, y)
 
-                if task == 2:
-                    test_preds = torch.argmax(test_outputs, dim=1).cpu().numpy()
-                else:
-                    test_preds = torch.sigmoid(test_outputs).round().cpu().numpy()
+        self.log('test/loss', loss, on_epoch=True)
+        self.log('test/acc', self.test_acc, on_epoch=True)
+        return loss
+    def configure_optimizers(self):
+ 
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+        return optimizer
+def find_optimal_lr(model: pl.LightningModule, datamodule: pl.LightningDataModule):
+    
+    # We use a temporary trainer for the finder, as it doesn't need logging or callbacks.
+    temp_trainer = pl.Trainer(
+        accelerator='auto',
+        logger=False,
+        enable_checkpointing=False
+    )
+    
+    tuner = Tuner(temp_trainer)
+    
+    # Run the learning rate finder
+    lr_finder = tuner.lr_find(model, datamodule=datamodule)
+    
+    # Get the suggestion
+    suggested_lr = lr_finder.suggestion()
+    
+    print(f"✅ Optimal learning rate found: {suggested_lr}")
+    
 
-                f1 = f1_score(test_labels, test_preds, average='macro' if task == 2 else 'binary')
-                cm = confusion_matrix(test_labels, test_preds)
-                
-                # Log evaluation metrics to both the console and the file
-                eval_log = f'TASK {task} Test F1 Score: {f1:.4f}\nConfusion Matrix:\n{cm}\n'
-                print(eval_log)
-                log_file.write(eval_log)
-                
-            model.train()
+    fig = lr_finder.plot(suggest=True)
+    fig.show()
+    fig.savefig("optlr.png")
+    
+    return suggested_lr
 
-# Load and preprocess data
-index_array, inchi_array, xyz_arrays, chiral_centers_array, rotation_array = npy_preprocessor('qm9_filtered.npy')
-if task == 4 or task == 5:
-    #print distribution of labels as a ratio
-    print("Distribution of Labels:")
-    print(pd.Series(generate_label_array(index_array, xyz_arrays, chiral_centers_array, rotation_array, task)).value_counts(normalize=True))
+def main():
+    pl.seed_everything(42)
+    TASK = 3
 
-# shell arg for task
-task = int(sys.argv[1])
+    EPOCHS = 20
+    BATCH_SIZE = 256
+    AUGMENT_DATA = True
+    
+    X, y = get_data(TASK)
+    
+    data_module = QMDataModule(X, y, batch_size=BATCH_SIZE, augment=AUGMENT_DATA)
+    model = ViTModule(learning_rate=1e-7)
 
-print("\nTASK:", task)
-device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(device)
-filtered_index, filtered_xyz, filtered_chiral, filtered_rotation = filter_data(index_array, xyz_arrays, chiral_centers_array, rotation_array, task)
-train_data, val_data, test_data = split_data(filtered_index, filtered_xyz, filtered_chiral, filtered_rotation)
+    optimal_lr = find_optimal_lr(model, data_module)
+    
+    # Update the model's hyperparameters with the found LR before training
+    model.hparams.learning_rate = optimal_lr
 
-model = train_model(train_data, val_data,  test_data, num_epochs=50, task=task)
+
+    trainer = pl.Trainer(
+        max_epochs=EPOCHS,
+        accelerator='auto',
+        logger=WandbLogger(project="ViT-Replication-QM9", name=f"yujun_bs64_emb216_lrfound{optimal_lr:.2e}"),
+        callbacks=[LearningRateMonitor(logging_interval='step')]
+    )
+    
+    trainer.fit(model, datamodule=data_module)
+    trainer.test(model, datamodule=data_module)
+    wandb.finish()
+
+if __name__ == "__main__":
+    main()
