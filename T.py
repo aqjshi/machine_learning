@@ -20,7 +20,28 @@ import os
 from pytorch_lightning.tuner import Tuner
 
 
-
+def augment_data(X_train, y_train, num_samples, rotate_molecule_func):
+    X_train_stacked = np.stack(X_train)
+    
+    rotated_X, rotated_y = [], []
+    original_num_samples = len(X_train_stacked)
+    
+    for _ in tqdm(range(num_samples), desc="Augmenting data"):
+        idx = np.random.randint(0, original_num_samples)
+        angle = np.random.uniform(0, 2 * np.pi)
+        axis = np.random.choice(['x', 'y', 'z'])
+        
+        # Use the stacked array for augmentation
+        aug_molecule = rotate_molecule_func(X_train_stacked[idx], angle, axis=axis)
+        rotated_X.append(aug_molecule)
+        rotated_y.append(y_train[idx])
+        
+    # Concatenate the original stacked data with the new augmented data
+    X_augmented = np.concatenate((X_train_stacked, np.array(rotated_X)), axis=0)
+    y_augmented = np.concatenate((y_train, np.array(rotated_y)), axis=0)
+    
+    print("Augmentation complete.")
+    return X_augmented, y_augmented
 class QMDataModule(pl.LightningDataModule):
     def __init__(self, X, y, batch_size=64, augment=False, num_aug_samples=1_000_000):
         super().__init__()
@@ -41,22 +62,8 @@ class QMDataModule(pl.LightningDataModule):
         
 
         if self.augment:
-            print(f"Generating {self.num_aug_samples} augmented samples...")
-            rotated_X, rotated_y = [], []
-            original_num_samples = len(X_train)
-            
-            # Use tqdm for a progress bar
-            for _ in tqdm(range(self.num_aug_samples), desc="Augmenting data"):
-                idx = np.random.randint(0, original_num_samples)
-                angle = np.random.uniform(0, 2 * np.pi)
-                axis = np.random.choice(['x', 'y', 'z'])
-                aug_molecule = rotate_molecule(X_train[idx], angle, axis=axis)
-                rotated_X.append(aug_molecule)
-                rotated_y.append(y_train[idx])
-            
-            X_train = np.concatenate((X_train, np.array(rotated_X)), axis=0)
-            y_train = np.concatenate((y_train, np.array(rotated_y)), axis=0)
-            print("Augmentation complete.")
+            X_train, y_train = augment_data(X_train, y_train, self.num_aug_samples, rotate_molecule)
+
 
         # Create the final datasets
         self.train_dataset = MoleculeSequenceDataset(X_train, y_train)
@@ -172,13 +179,20 @@ def main():
     BATCH_SIZE = 256
     AUGMENT_DATA = True
     
-    X, y = get_data(TASK)
-    
+    df = npy_preprocessor("qm9_filtered.npy")
+    # df = df[df['chiral_centers'].apply(len)==1]
+
+    X = df['xyz'].values 
+
+    y = (np.stack(df['rotation'].values)[:, 1] > 0).astype(int)
+
+
     data_module = QMDataModule(X, y, batch_size=BATCH_SIZE, augment=AUGMENT_DATA)
     model = ViTModule(learning_rate=1e-7)
 
-    optimal_lr = find_optimal_lr(model, data_module)
-    
+    # optimal_lr = find_optimal_lr(model, data_module)
+    # 4e-05 precalculated
+    optimal_lr =4e-05 
     # Update the model's hyperparameters with the found LR before training
     model.hparams.learning_rate = optimal_lr
 
@@ -186,7 +200,7 @@ def main():
     trainer = pl.Trainer(
         max_epochs=EPOCHS,
         accelerator='auto',
-        logger=WandbLogger(project="ViT-Replication-QM9", name=f"yujun_bs64_emb216_lrfound{optimal_lr:.2e}"),
+        logger=WandbLogger(project="ViT-Replication-QM9", name=f"yujun_all_bs64_emb216_lrfound{optimal_lr:.2e}"),
         callbacks=[LearningRateMonitor(logging_interval='step')]
     )
     
