@@ -83,11 +83,17 @@ class QMDataModule(pl.LightningDataModule):
         return DataLoader(self.test_dataset, batch_size=self.batch_size * 2, num_workers=0)
 
 class ViTModule(pl.LightningModule):
-    def __init__(self, learning_rate):
+    def __init__(self, learning_rate,embedding_dim, embedding_dropout_rate=0.0, mlp_dropout_rate=0.0):
         super().__init__()
         self.save_hyperparameters()
-        self.model = ViT(embedding_dim=216, num_classes=2)
-        
+        self.model = ViT(embedding_dim=embedding_dim, num_classes=2,             
+                         embedding_dropout=embedding_dropout_rate, 
+                            mlp_dropout=mlp_dropout_rate,          
+                            num_transformer_layers = 6, #L
+                            num_heads = 6,     #table1
+                            mlp_size = 1024,     #table 1
+                            )
+   
         self.criterion = nn.CrossEntropyLoss()
     
         self.train_acc = Accuracy(task="multiclass", num_classes=2)
@@ -145,41 +151,11 @@ class ViTModule(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
-        
-        EPOCHS = self.trainer.max_epochs 
-        decay_start_epoch = int(EPOCHS * 1 / 2) 
-    
-        scheduler_initial = LinearLR(
-            optimizer, 
-            start_factor=1.0, 
-            end_factor=1.0, 
-            total_iters=decay_start_epoch
-        )
-        
-    
-        scheduler_decay = LinearLR(
-            optimizer, 
-            start_factor=1.0, 
-            end_factor=0.1, 
-            total_iters=decay_start_epoch
-        )
+        optimizer = torch.optim.Adam(
+            params=self.parameters(), 
+            lr=self.hparams.learning_rate)
+        return optimizer
 
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[scheduler_initial, scheduler_decay],
-            milestones=[decay_start_epoch]
-        )
-        
-        
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'interval': 'epoch',
-                'frequency': 1,
-            }
-        }
 def find_optimal_lr(model: pl.LightningModule, datamodule: pl.LightningDataModule):
     
     # We use a temporary trainer for the finder, as it doesn't need logging or callbacks.
@@ -201,19 +177,21 @@ def find_optimal_lr(model: pl.LightningModule, datamodule: pl.LightningDataModul
     
 
     fig = lr_finder.plot(suggest=True)
-    fig.show()
+    # fig.show()
     fig.savefig("optlr.png")
     
     return suggested_lr
 
 def main():
     pl.seed_everything(42)
-    TASK = 0
+    TASK = 1
 
-    EPOCHS = 20
-    BATCH_SIZE = 256
+    EPOCHS = 10
+    BATCH_SIZE = 512
     AUGMENT_DATA = True
-    
+    emb_dim = 384
+    emb_dropout = 0
+    mlp_dropout = 0    
     df = npy_preprocessor("qm9_filtered.npy")
     if TASK == 1:
         df = df[df['chiral_centers'].apply(len)==1]
@@ -224,11 +202,11 @@ def main():
 
 
     data_module = QMDataModule(X, y, batch_size=BATCH_SIZE, augment=AUGMENT_DATA)
-    model = ViTModule(learning_rate=1e-7)
+    model = ViTModule(learning_rate=1e-7, embedding_dim= emb_dim, embedding_dropout_rate=emb_dropout, mlp_dropout_rate=mlp_dropout)
 
     # optimal_lr = find_optimal_lr(model, data_module)
     # 4e-05 precalculated
-    optimal_lr = 1e-04
+    optimal_lr = 4e-05
 
 
     model.hparams.learning_rate = optimal_lr
@@ -237,7 +215,7 @@ def main():
     trainer = pl.Trainer(
         max_epochs=EPOCHS,
         accelerator='auto',
-        logger=WandbLogger(project="ViT-Replication-QM9", name=f"yujun_TASK{TASK}_bs{BATCH_SIZE}_emb216_lr{optimal_lr:.2e}_decay_aug{AUGMENT_DATA}"),
+        logger=WandbLogger(project="ViT-Replication-QM9", name=f"yujun_TASK{TASK}_aug1000k"),
         callbacks=[LearningRateMonitor(logging_interval='step')]
     )
     
