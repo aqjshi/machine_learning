@@ -151,14 +151,49 @@ class ViTModule(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
+  
+        EPOCHS = self.trainer.max_epochs if hasattr(self.trainer, 'max_epochs') else 30 
+        
+    
+        decay_start_epoch = int(EPOCHS / 2)
+      
         optimizer = torch.optim.Adam(
             params=self.parameters(), 
-            lr=self.hparams.learning_rate)
-        return optimizer
+            lr=self.hparams.learning_rate
+        )
+        
+
+        scheduler_initial = LinearLR(
+            optimizer, 
+            start_factor=1.0, 
+            end_factor=1.0, 
+            total_iters=decay_start_epoch
+        )
+        
+
+        scheduler_decay = LinearLR(
+            optimizer, 
+            start_factor=1.0, 
+            end_factor=0.1,  # Decays to 10% of the initial LR
+            total_iters=(EPOCHS - decay_start_epoch)
+        )
+
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[scheduler_initial, scheduler_decay],
+            milestones=[decay_start_epoch]
+        )
+        
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'epoch', # Apply the schedule step after every epoch
+                'frequency': 1,
+            }
+        }
 
 def find_optimal_lr(model: pl.LightningModule, datamodule: pl.LightningDataModule):
-    
-    # We use a temporary trainer for the finder, as it doesn't need logging or callbacks.
     temp_trainer = pl.Trainer(
         accelerator='auto',
         logger=False,
@@ -190,8 +225,8 @@ def main():
     BATCH_SIZE = 512
     AUGMENT_DATA = True
     emb_dim = 384
-    emb_dropout = 0.1
-    mlp_dropout = 0    
+    emb_dropout = 0.05
+    mlp_dropout = 0.05 
     df = npy_preprocessor("qm9_filtered.npy")
     if TASK == 1:
         df = df[df['chiral_centers'].apply(len)==1]
@@ -215,7 +250,7 @@ def main():
     trainer = pl.Trainer(
         max_epochs=EPOCHS,
         accelerator='auto',
-        logger=WandbLogger(project="ViT-Replication-QM9", name=f"yujun_TASK{TASK}_aug500k_embdrop{emb_dropout}"),
+        logger=WandbLogger(project="ViT-Replication-QM9", name=f"yujun_TASK{TASK}_aug500k_embdrop{emb_dropout}_mlpdrop{mlp_dropout}_linear"),
         callbacks=[LearningRateMonitor(logging_interval='step')]
     )
     
