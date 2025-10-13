@@ -45,7 +45,7 @@ def augment_data(X_train, y_train, num_samples, rotate_molecule_func):
 
 
 class QMDataModule(pl.LightningDataModule):
-    def __init__(self, X, y, batch_size=64, augment=False, num_aug_samples=1_000_000):
+    def __init__(self, X, y, batch_size=64, augment=False, num_aug_samples=500_000):
         super().__init__()
         self.X = X
         self.y = y
@@ -190,7 +190,7 @@ def main():
     BATCH_SIZE = 512
     AUGMENT_DATA = True
     emb_dim = 384
-    emb_dropout = 0
+    emb_dropout = 0.1
     mlp_dropout = 0    
     df = npy_preprocessor("qm9_filtered.npy")
     if TASK == 1:
@@ -215,7 +215,7 @@ def main():
     trainer = pl.Trainer(
         max_epochs=EPOCHS,
         accelerator='auto',
-        logger=WandbLogger(project="ViT-Replication-QM9", name=f"yujun_TASK{TASK}_aug1000k"),
+        logger=WandbLogger(project="ViT-Replication-QM9", name=f"yujun_TASK{TASK}_aug500k_embdrop{emb_dropout}"),
         callbacks=[LearningRateMonitor(logging_interval='step')]
     )
     
